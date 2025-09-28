@@ -83,9 +83,12 @@ end
 
 % Load/normalize GMM once (global model)
 assert(~isempty(opt.ParamsFile), 'ParamsFile is required for the runner.');
-GMM = detector.readGmmParams(opt.ParamsFile, 'UsedChannels', opt.UsedChannels, ...
-                             'AssumeOrder', opt.AssumeOrder, 'PreferInv', true);
-
+rawParams = detector.readGmmParams(opt.ParamsFile);
+[params, usedStr] = local_select_channels(rawParams, opt.UsedChannels, opt.AssumeOrder);
+paramsStruct = struct('mu', single(params.mu), 'Sigma', single(params.Sigma));
+if ~isempty(params.radius)
+    paramsStruct.radius = single(params.radius);
+end
 % Output subfolders
 if opt.SaveMask,  outMaskDir  = fullfile(outFolder,'masks');   if ~isfolder(outMaskDir),  mkdir(outMaskDir);  end, end
 if opt.SaveConf,  outConfDir  = fullfile(outFolder,'conf');    if ~isfolder(outConfDir),  mkdir(outConfDir);  end, end
@@ -95,7 +98,7 @@ R = repmat(struct('imagePath','','maskPath','','statsPath','','ok',false,'err','
 
 if opt.Verbose
     fprintf('[run] %d images | UsedChannels=%s | ConfThresh=%.3f | Params=%s\n', ...
-        numel(files), char(GMM.usedStr), opt.ConfThresh, char(opt.ParamsFile));
+        numel(files), char(usedStr), opt.ConfThresh, char(opt.ParamsFile));
 end
 
 % -------- main loop --------
@@ -111,37 +114,37 @@ for i=1:numel(files)
         if size(I,3)>3, I = I(:,:,1:3); end
 
         % --- read image meta (your tolerant reader)
-        M = detector.readImageMeta(fp);
-
+         [folder, base, ~] = fileparts(fp);
+        M = detector.readImageMeta(folder, base);
+        if isempty(fieldnames(M))
+            M = detector.stubMetaFromName(base);
+        end
         % --- resolve scale precedence
         % Explicit > meta.umPerPixel > meta.magnification via umPerPixel lookup > default 1
         if ~isempty(opt.UmPerPixel)
             umPerPx = double(opt.UmPerPixel);
-        elseif isfield(M,'umPerPixel') && ~isempty(M.umPerPixel)
-            umPerPx = double(M.umPerPixel);
-        elseif isfield(M,'magnification') && ~isempty(M.magnification)
-            umPerPx = detector.umPerPixel(M.magnification);
-        elseif ~isempty(opt.Magnification)
-            umPerPx = detector.umPerPixel(opt.Magnification);
         else
-            umPerPx = 1;
+         umPerPx = local_um_per_pixel(M, opt.Magnification);
+            if isempty(umPerPx)
+                umPerPx = 1;
+            end
         end
 
         % --- preprocess (flatfield optional, keep intensity type stable)
-        if isempty(flatfield)
-            F = reshape([255 255 255],[1 1 3]); % neutral noop
-        else
-            F = flatfield;
+        procOpts = struct('UsedChannels', usedStr, 'BackgroundCeiling', 241);
+        if ~isempty(flatfield)
+            procOpts.Flatfield = flatfield;
         end
-        Icorr = detector.preprocess(I, F, 'OutputType','uint8', 'MaxBackgroundValue', 241);
+                proc = detector.preprocess(I, procOpts);
 
-        % --- inference
-        [mask0, labelMap, confMap, ~] = detector.inferGMM(Icorr, GMM, ...
-            'UsedChannels', GMM.usedStr, ...
-            'Chi2Confidence', opt.Chi2Confidence, ...
-            'UseRadiusGating', opt.UseRadiusGating, ...
-            'ConfThresh', 0);  % do thresholding in postprocess
-
+         % --- inference (toolbox-free src/+detector implementation)
+        inferOpts = struct('Chi2Conf', logical(opt.Chi2Confidence), ...
+                           'ReturnBestComp', true, ...
+                           'MinChannelGate', logical(opt.UseRadiusGating));
+        infOut = detector.inferGMM(proc, paramsStruct, inferOpts);
+        confMap  = infOut.confMap;
+        labelMap = infOut.labelMap;
+        
         % --- postprocess (threshold, morphology, component filters)
         pp = detector.postprocess(confMap, labelMap, struct( ...
             'ConfThresh',   opt.ConfThresh, ...
@@ -171,8 +174,7 @@ for i=1:numel(files)
             % also dump a .json sidecar for completeness
             jsonPath = fullfile(outStatsDir, [base '_stats.json']);
             S = table2struct(pp.stats);
-            meta = struct('imagePath',fp, 'umPerPixel', umPerPx, 'usedChannels', char(GMM.usedStr));
-            J = struct('meta', meta, 'flakes', {S});
+           meta = struct('imagePath',fp, 'umPerPixel', umPerPx, 'usedChannels', char(usedStr));
             fid = fopen(jsonPath,'w'); fwrite(fid, jsonencode(J),'char'); fclose(fid);
         end
 
@@ -223,4 +225,278 @@ switch lower(e)
 end
 F = double(F);
 if ndims(F)==2, F = repmat(F,1,1,3); end
+end
+function [out, usedStr] = local_select_channels(rawParams, requested, assumeOrder)
+% Convert loaded GMM params (JSON or legacy structs) to the subset/order
+% expected by detector.inferGMM (C x K in [0,1], RGB-oriented).
+
+usedStr = upper(char(requested));
+usedStr = usedStr(ismember(usedStr,'RGB'));
+if isempty(usedStr)
+    usedStr = 'RGB';
+end
+
+if nargin < 3 || isempty(assumeOrder)
+    assumeOrder = 'auto';
+end
+
+orderPref = upper(string(assumeOrder));
+if orderPref=="AUTO"
+    if isfield(rawParams,'channelOrderIn') && ~isempty(rawParams.channelOrderIn)
+        orderPref = upper(string(rawParams.channelOrderIn));
+    elseif isfield(rawParams,'channelOrder') && ~isempty(rawParams.channelOrder)
+        orderPref = upper(string(rawParams.channelOrder));
+    elseif isfield(rawParams,'mu_bgr')
+        orderPref = "BGR";
+    else
+        orderPref = "RGB";
+    end
+elseif ~(orderPref=="RGB" || orderPref=="BGR")
+    orderPref = "RGB";
+end
+
+% Gather channel-first (C x K) arrays and remember their current order.
+muCk = [];
+SigmaC = [];
+radiusCk = [];
+orderStr = '';
+
+if isfield(rawParams,'mu_rgb')
+    muCk = double(rawParams.mu_rgb.');
+    if isfield(rawParams,'Sigma_rgb'),  SigmaC = double(rawParams.Sigma_rgb); end
+    if isfield(rawParams,'radius_rgb'), radiusCk = double(rawParams.radius_rgb.'); end
+    orderStr = 'RGB';
+    if orderPref=="BGR"
+        if isfield(rawParams,'mu_bgr')
+            muCk = double(rawParams.mu_bgr.');
+            if isfield(rawParams,'Sigma_bgr'),  SigmaC = double(rawParams.Sigma_bgr); end
+            if isfield(rawParams,'radius_bgr'), radiusCk = double(rawParams.radius_bgr.'); end
+        else
+            perm = [3 2 1];
+            muCk = muCk(perm,:);
+            if ~isempty(SigmaC),  SigmaC = SigmaC(perm,perm,:); end
+            if ~isempty(radiusCk), radiusCk = radiusCk(perm,:); end
+        end
+        orderStr = 'BGR';
+    end
+else
+    if isfield(rawParams,'mu')
+        muCk = double(rawParams.mu);
+    elseif isfield(rawParams,'mu_bgr')
+        muCk = double(rawParams.mu_bgr.');
+        orderPref = "BGR";
+    else
+        error('Params struct missing mu/mu_rgb fields.');
+    end
+    if orderPref=="BGR"
+        if isfield(rawParams,'Sigma_bgr')
+            SigmaC = double(rawParams.Sigma_bgr);
+        elseif isfield(rawParams,'Sigma')
+            SigmaC = double(rawParams.Sigma);
+        end
+        if isfield(rawParams,'radius_bgr')
+            radiusCk = double(rawParams.radius_bgr);
+            if size(radiusCk,1) ~= size(muCk,1)
+                radiusCk = double(rawParams.radius_bgr.');
+            end
+        elseif isfield(rawParams,'radius')
+            radiusCk = double(rawParams.radius);
+        end
+    else
+        if isfield(rawParams,'Sigma')
+            SigmaC = double(rawParams.Sigma);
+        elseif isfield(rawParams,'Sigma_rgb')
+            SigmaC = double(rawParams.Sigma_rgb);
+        end
+        if isfield(rawParams,'radius')
+            radiusCk = double(rawParams.radius);
+        elseif isfield(rawParams,'radius_rgb')
+            radiusCk = double(rawParams.radius_rgb);
+            if size(radiusCk,1) ~= size(muCk,1)
+                radiusCk = double(rawParams.radius_rgb.');
+            end
+        end
+    end
+
+    % Ensure muCk is C x K
+    if isfield(rawParams,'K') && ~isempty(rawParams.K)
+        expectedK = double(rawParams.K);
+    else
+        expectedK = size(muCk,2);
+    end
+    if size(muCk,2) ~= expectedK && size(muCk,1) == expectedK
+        muCk = muCk.';
+    end
+    if size(muCk,1) < size(muCk,2) && size(muCk,2) ~= expectedK
+        muCk = muCk.';
+    end
+    orderStr = local_align_order(orderPref, size(muCk,1));
+end
+
+% Reorder to canonical RGB order (keeping only available channels).
+canonOrder = local_canonical_from(orderStr);
+canonOrder = canonOrder(1:min(numel(canonOrder), size(muCk,1)));
+permToCanon = local_order_to_target(orderStr, canonOrder);
+muCk = muCk(permToCanon,:);
+if ~isempty(SigmaC),  SigmaC = SigmaC(permToCanon, permToCanon, :); end
+if ~isempty(radiusCk)
+    if size(radiusCk,1) == size(muCk,1)
+        radiusCk = radiusCk(permToCanon,:);
+    else
+        radiusCk = radiusCk(:, permToCanon).';
+    end
+end
+
+% Convert to components-first for channel selection.
+muAll = permute(muCk, [2 1]);              % K x C
+K = size(muAll,1);
+nChan = size(muAll,2);
+
+if numel(canonOrder) ~= nChan
+    error('Canonical channel order (%s) mismatch with parameter count (%d).', canonOrder, nChan);
+end
+
+if isempty(SigmaC)
+    error('GMM params missing covariance matrices (Sigma).');
+end
+if size(SigmaC,3) ~= K
+    error('Sigma third dimension (%d) did not match K (%d).', size(SigmaC,3), K);
+end
+
+% Map requested channels into canonical order.
+idx = zeros(1, numel(usedStr));
+for ii = 1:numel(usedStr)
+    pos = find(canonOrder == usedStr(ii), 1);
+    assert(~isempty(pos), 'Requested channel %s missing in params (available: %s).', usedStr(ii), canonOrder);
+    idx(ii) = pos;
+end
+
+mu = permute(muAll(:, idx), [2 1]);
+Sigma = zeros(numel(idx), numel(idx), K, 'like', SigmaC);
+for k = 1:K
+    Sigma(:,:,k) = SigmaC(idx, idx, k);
+end
+
+if ~isempty(radiusCk)
+    if size(radiusCk,1) ~= nChan
+        radiusCk = radiusCk.';
+    end
+    radius = radiusCk(idx, :);
+else
+    radius = [];
+end
+
+out = struct('mu', single(mu), 'Sigma', single(Sigma));
+if ~isempty(radius)
+    out.radius = single(radius);
+else
+    out.radius = [];
+end
+usedStr = char(usedStr);
+end
+
+function um = local_um_per_pixel(meta, fallbackMagnification)
+% Resolve µm/px from meta struct or fallback magnification.
+um = [];
+magVal = [];
+if isstruct(meta) && isfield(meta,'magnification') && ~isempty(meta.magnification)
+    magVal = meta.magnification;
+elseif ~isempty(fallbackMagnification)
+    magVal = fallbackMagnification;
+end
+if isempty(magVal)
+    return;
+end
+if ischar(magVal) || isstring(magVal)
+    magStr = char(string(magVal));
+    magVal = str2double(magStr);
+    if ~isfinite(magVal)
+        tok = regexp(magStr, '(\d+(\.\d+)?)', 'tokens', 'once');
+        if ~isempty(tok)
+            magVal = str2double(tok{1});
+        end
+    end
+end
+if ~isfinite(magVal)
+    return;
+end
+try
+    idx = detector.magnificationToIndex(double(magVal));
+    um = detector.umPerPixel(idx);
+catch
+    um = [];
+end
+end
+
+function orderStr = local_align_order(orderHint, count)
+% Normalize an order hint (e.g. 'auto','BGR') to a char vector length COUNT.
+base = 'RGB';
+hint = upper(char(string(orderHint)));
+hint = hint(ismember(hint,'RGB'));
+orderStr = '';
+seen = false(1,3);
+for i = 1:numel(hint)
+    ch = hint(i);
+    idx = find(base==ch, 1);
+    if ~isempty(idx) && ~seen(idx)
+        orderStr(end+1) = ch; %#ok<AGROW>
+        seen(idx) = true;
+    end
+end
+for i = 1:numel(base)
+    if numel(orderStr) >= count, break; end
+    if ~seen(i)
+        orderStr(end+1) = base(i); %#ok<AGROW>
+        seen(i) = true;
+    end
+end
+if isempty(orderStr)
+    orderStr = base;
+end
+if numel(orderStr) < count
+    % pad by repeating base sequence if necessary (defensive; typically count<=3)
+    while numel(orderStr) < count
+        orderStr(end+1) = base( mod(numel(orderStr), numel(base)) + 1 ); %#ok<AGROW>
+    end
+end
+orderStr = orderStr(1:min(numel(orderStr), count));
+end
+
+function canon = local_canonical_from(orderStr)
+% Derive canonical RGB order limited to channels present in orderStr.
+orderStr = upper(char(orderStr));
+base = 'RGB';
+canon = '';
+for i = 1:numel(base)
+    ch = base(i);
+    if any(orderStr == ch)
+        canon(end+1) = ch; %#ok<AGROW>
+    end
+end
+if isempty(canon)
+    canon = orderStr;
+else
+    % append any remaining characters (defensive) preserving appearance order
+    for i = 1:numel(orderStr)
+        ch = orderStr(i);
+        if ~any(canon == ch)
+            canon(end+1) = ch; %#ok<AGROW>
+        end
+    end
+end
+end
+
+function perm = local_order_to_target(orderStr, target)
+% Return indices so that orderStr(perm) == target.
+orderStr = upper(char(orderStr));
+target = upper(char(target));
+perm = zeros(1, numel(target));
+for i = 1:numel(target)
+    ch = target(i);
+    idx = find(orderStr == ch, 1);
+    if isempty(idx)
+        error('Channel %s missing when reordering (available: %s).', ch, orderStr);
+    end
+    perm(i) = idx;
+end
 end
