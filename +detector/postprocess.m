@@ -124,11 +124,13 @@ ecc       = arrayfun(@(p) p.Eccentricity, keptProps)';
 maj       = arrayfun(@(p) p.MajorAxisLength, keptProps)';
 minax     = arrayfun(@(p) p.MinorAxisLength, keptProps)';
 mconf     = arrayfun(@(p) p.MeanConf, keptProps)';
+varNames = {'area_px','area_um2','centroid_xy','solidity','eccentricity', ...
+            'major_axis','minor_axis','mean_conf','labelK'};
 
 out.mask  = mask;
 out.props = keptProps;
 out.stats = table(area_px, area_um2, centroids, solidity, ecc, maj, minax, mconf, labelK, ...
-    'VariableNames', {'area_px','area_um2','centroid_xy','solidity','eccentricity','major_axis','minor_axis','mean_conf','labelK'});
+  'VariableNames', varNames);
 out.debug = struct('areaFloorPx',areaFloorPx,'pxPerUm2',pxPerUm2);
 end
 
