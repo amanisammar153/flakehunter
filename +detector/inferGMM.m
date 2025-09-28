@@ -69,9 +69,17 @@ N = size(X,1);
 K = size(mu,2);
 if isempty(invSigma)
     invSigma = zeros(C,C,K,'single');
-    for k=1:K
+    for k = 1:K
         S = double(Sigma(:,:,k)) + 1e-9*eye(C);
-        invSigma(:,:,k) = single(pinv(S));
+        % Prefer Cholesky to avoid the pseudoinverse when the covariance is SPD.
+    [R,p] = chol(S);
+    if p==0
+        I = eye(C);
+        iSigma(:,:,k) = single(R \ (R' \ I));
+    else
+        % Fall back to pseudoinverse if the component covariance is ill-conditioned.
+        iSigma(:,:,k) = single(pinv(S));
+    end
     end
 end
 if isempty(radius)
