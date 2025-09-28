@@ -1,0 +1,7 @@
+Color channels: use RGB everywhere in MATLAB. If a Python GMM JSON is BGR-ordered, the loader reorders to RGB internally.
+
+Results root: C:\Users\amanis\Documents\MATLAB\matlab-detector\results
+
+Parameters path: C:\Users\amanis\Documents\MATLAB\matlab-detector\Parameters (and it is on MATLAB path)
+
+Magnification parsing: filenames must contain _x20 before extension.
